@@ -32,6 +32,16 @@ Metadata:
           - GlueCopySchedule
           - BlobToS3SyncStartDate
       - Label:
+          default: Lambda in a VPC (Optional)
+        Parameters:
+          - LambdaVpcId
+          - LambdaSubnets
+      - Label:
+          default: Glue in a VPC (Optional)
+        Parameters:
+          - GlueConnectionName1
+          - GlueConnectionName2
+      - Label:
           default: Advanced Settings (DO NOT CHANGE)
         Parameters:
           - PartitionSize
@@ -123,6 +133,24 @@ Parameters:
     Description: Minimum age of the objects to be copied. Must be a valid format (YYYYMMDD)
     Default: "20220820"
 
+  ### Optional Parameters 
+  LambdaVpcId:
+    Type: String
+    Description: VPC where the Lambda will be deployed. (VPC Should be configured to allow connectivity to S3, SecretManager, SNS and Blob Storage Private Endpoint)
+
+  LambdaSubnets:
+    Type: CommaDelimitedList
+    Description: Subnets where the Lambda will be deployed.
+
+  GlueConnectionName1:
+    Type: String
+    Description: Glue VPC Connection name. (Glue Connection should be created before deployment)
+
+  GlueConnectionName2:
+    Type: String
+    Description: Second Glue VPC Connection name, if needed. (Glue Connection should be created before deployment)
+ 
+  
   ### Advanced Parameters
   PartitionSize:
     Description: Multipart upload partition size in bytes
@@ -137,10 +165,17 @@ Parameters:
     Description: Retain Azure storage path
     Default: "true"
     AllowedValues:
-      - true
-      - false
+      - "true"
+      - "false"
 Conditions:
   Deploy: !Equals [!Ref DeploymentType, "automatic"]
+
+  ### Reosurces in VPC Conditions 
+  DeployLambdaInVPC: !Not [!Equals [!Ref LambdaVpcId, ""]] 
+  GlueConnection1: !Not [!Equals [!Ref GlueConnectionName1, ""]] 
+  GlueConnection2: !Not [!Equals [!Ref GlueConnectionName2, ""]] 
+  DeployGlueInVPC: !Or [!Condition GlueConnection1, !Condition GlueConnection2]
+  GlueHA: !And [ !Condition GlueConnection1, !Condition GlueConnection2]
 
 Resources:
   ### Create a Resource Group for CloudFormation resources
@@ -349,6 +384,38 @@ Resources:
                 - glue.amazonaws.com
             Action: sts:AssumeRole
       Policies:
+        - !If
+          - DeployGlueInVPC
+          - PolicyName: !Sub ${PrefixCode}iap${EnvironmentCode}cidazureglueconnection
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - glue:GetConnection 
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                    - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:connection/*"
+                - Effect: Allow
+                  Action:
+                    - ec2:DescribeSubnets
+                    - ec2:DescribeSecurityGroups
+                    - ec2:DescribeVpcEndpoints
+                    - ec2:DescribeRouteTables
+                  Resource:
+                    - "*"
+                - Effect: Allow
+                  Sid: CreateTagsNetworkInterface
+                  Action:
+                    - ec2:CreateTags
+                    - ec2:CreateNetworkInterface
+                    - ec2:AttachNetworkInterface
+                    - ec2:DeleteNetworkInterface
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                    - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+                    - !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+          - !Ref "AWS::NoValue"
         - PolicyName: !Sub ${PrefixCode}iap${EnvironmentCode}cidazureglue
           PolicyDocument:
             Version: "2012-10-17"
@@ -419,6 +486,11 @@ Resources:
     Properties:
       Description: Cloud Intelligence Dashboard for Azure IAM role for Lambda
       RoleName: !Sub ${PrefixCode}iar${EnvironmentCode}cidazurelambda
+      ManagedPolicyArns:
+        !If
+          - DeployLambdaInVPC
+          - - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+          - - !Ref "AWS::NoValue"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -612,6 +684,23 @@ Resources:
         Name: glueetl
         ScriptLocation: !Sub "s3://${SourceBucket}/cid-azure-gluejob-cfn.py"
         PythonVersion: "3"
+      Connections: 
+        !If
+          - DeployGlueInVPC
+          - Connections:
+              !If 
+                - GlueHA
+                - 
+                  - !Ref GlueConnectionName1
+                  - !Ref GlueConnectionName2
+                -
+                  !If 
+                    - GlueConnection1
+                    -
+                      - !Ref GlueConnectionName1
+                    - 
+                      - !Ref GlueConnectionName2
+          - !Ref "AWS::NoValue"
       DefaultArguments:
         "--enable-glue-datacatalog": true
         "--enable-spark-ui": true
@@ -981,6 +1070,13 @@ Resources:
         Size: 512
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1021,6 +1117,13 @@ Resources:
         Size: 512
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1060,6 +1163,13 @@ Resources:
         Size: 5120
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1096,6 +1206,13 @@ Resources:
         Size: 512
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1135,6 +1252,13 @@ Resources:
         Size: 512
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1171,6 +1295,13 @@ Resources:
         Size: 512
       DeadLetterConfig:
         TargetArn: !Ref SNSTopicDeadLetterQueue
+      VpcConfig:
+        !If
+          - DeployLambdaInVPC
+          - SecurityGroupIds:
+              - !GetAtt LambdaSecurityGroup.GroupId
+            SubnetIds: !Ref LambdaSubnets
+          - !Ref "AWS::NoValue"
       Tags:
         - Key: Owner
           Value: !Sub ${OwnerTag}
@@ -1409,6 +1540,17 @@ Resources:
       Principal: "events.amazonaws.com"
       SourceArn: !GetAtt ScheduledRule.Arn
     Condition: Deploy
+
+  ### Optional Values
+  LambdaSecurityGroup:
+    Condition: DeployLambdaInVPC
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda Security Group
+      VpcId: !Ref LambdaVpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
 
   ### Cloudwatch Dashboard
   CloudwatchDashboard:
